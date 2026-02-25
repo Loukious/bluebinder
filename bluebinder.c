@@ -63,6 +63,91 @@
 
 #define HCI_PRIMARY    0x00
 
+/* BD Address spoofing support */
+static uint8_t spoofed_bdaddr[6] = {0};
+static uint8_t original_bdaddr[6] = {0};
+static bool bdaddr_spoofing = false;
+static bool original_bdaddr_captured = false;
+
+static void format_bdaddr(const uint8_t *addr, char *out, size_t out_size) {
+    snprintf(out, out_size, "%02X:%02X:%02X:%02X:%02X:%02X",
+             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+}
+
+
+/* Spoof address file — write XX:XX:XX:XX:XX:XX to this file,
+ * then cycle hci0 (down/up). bluebinder reads it on every
+ * Read_BD_ADDR response and replaces the address.
+ * Delete the file to stop spoofing.
+ */
+#define BDADDR_SPOOF_FILE "/tmp/bluebinder_spoof_addr"
+
+static void check_spoof_file(void) {
+    FILE *f = fopen(BDADDR_SPOOF_FILE, "r");
+    if (!f) {
+        /* File removed = stop spoofing */
+        if (bdaddr_spoofing) {
+            bdaddr_spoofing = false;
+            fprintf(stderr, "bluebinder: spoof file removed, spoofing disabled\n");
+        }
+        return;
+    }
+    char line[64] = {0};
+    if (fgets(line, sizeof(line), f)) {
+        unsigned int b[6];
+        if (sscanf(line, "%02x:%02x:%02x:%02x:%02x:%02x",
+                   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+            uint8_t new_addr[6];
+            for (int i = 0; i < 6; i++)
+                new_addr[i] = (uint8_t)b[5 - i];
+
+            if (!bdaddr_spoofing || memcmp(spoofed_bdaddr, new_addr, 6) != 0) {
+                memcpy(spoofed_bdaddr, new_addr, 6);
+                bdaddr_spoofing = true;
+                char buf[18];
+                format_bdaddr(spoofed_bdaddr, buf, sizeof(buf));
+                fprintf(stderr, "bluebinder: spoof address loaded: %s\n", buf);
+            }
+        }
+    }
+    fclose(f);
+}
+
+/* Intercept HCI event responses from the HAL */
+static void intercept_bdaddr_event(uint8_t *packet, gsize count) {
+    if (count < 13)
+        return;
+
+    /* Command Complete event (0x0E) */
+    if (packet[1] != 0x0E)
+        return;
+
+    uint16_t opcode = (uint16_t)packet[5] << 8 | packet[4];
+
+    /* Read_BD_ADDR: opcode 0x1009 */
+    if (opcode == 0x1009 && packet[6] == 0x00 && count >= 13) {
+        /* Always capture the original address on first sight */
+        if (!original_bdaddr_captured) {
+            memcpy(original_bdaddr, &packet[7], 6);
+            original_bdaddr_captured = true;
+            char buf[18];
+            format_bdaddr(original_bdaddr, buf, sizeof(buf));
+            fprintf(stderr, "bluebinder: captured original BD_ADDR: %s\n", buf);
+        }
+
+        /* Check spoof file */
+        check_spoof_file();
+
+        /* Replace if spoofing is active */
+        if (bdaddr_spoofing) {
+            char spoof_buf[18];
+            format_bdaddr(spoofed_bdaddr, spoof_buf, sizeof(spoof_buf));
+            fprintf(stderr, "bluebinder: spoofing Read_BD_ADDR response to %s\n", spoof_buf);
+            memcpy(&packet[7], spoofed_bdaddr, 6);
+        }
+    }
+}
+
 #define BINDER_BLUETOOTH_SERVICE_DEVICE "/dev/hwbinder"
 #define BINDER_BLUETOOTH_SERVICE_IFACE "android.hardware.bluetooth@1.0::IBluetoothHci"
 #define BINDER_BLUETOOTH_SERVICE_IFACE_CALLBACKS "android.hardware.bluetooth@1.0::IBluetoothHciCallbacks"
@@ -789,6 +874,11 @@ bluebinder_callbacks_transact(
                 }
             }
 
+            /* Intercept BD address in HCI event responses */
+            if (packet[0] == HCI_EVENT_PKT) {
+                intercept_bdaddr_event(packet, count + 1);
+            }
+
             dev_write_packet(proxy, packet, count + 1);
 
             free(packet);
@@ -886,6 +976,33 @@ int main(int argc, char *argv[])
 
     memset(&proxy, 0, sizeof(struct proxy));
 
+    /* BD address spoofing:
+     * 1) Live interception: spooftooph commands are detected automatically
+     *    while bluebinder is running — no setup needed.
+     * 2) Optional pre-set via env var: BT_SPOOF_ADDR=XX:XX:XX:XX:XX:XX bluebinder
+     */
+    const char *spoof_env = getenv("BT_SPOOF_ADDR");
+    if (spoof_env) {
+        unsigned int b[6];
+        if (sscanf(spoof_env, "%02x:%02x:%02x:%02x:%02x:%02x",
+                   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+            for (int i = 0; i < 6; i++)
+                spoofed_bdaddr[i] = (uint8_t)b[5 - i];
+            bool valid = false;
+            for (int i = 0; i < 6; i++) {
+                if (spoofed_bdaddr[i] != 0) { valid = true; break; }
+            }
+            if (valid) {
+                bdaddr_spoofing = true;
+                fprintf(stderr, "bluebinder: pre-set spoof BD_ADDR to %s (from env)\n", spoof_env);
+            }
+        }
+        if (!bdaddr_spoofing) {
+            fprintf(stderr, "bluebinder: invalid BT_SPOOF_ADDR, use XX:XX:XX:XX:XX:XX\n");
+        }
+    }
+    fprintf(stderr, "bluebinder: live BD_ADDR spoofing enabled — use spooftooph normally\n");
+
     proxy.sm = gbinder_servicemanager_new(BINDER_BLUETOOTH_SERVICE_DEVICE);
 
     proxy.remote = gbinder_remote_object_ref
@@ -943,7 +1060,7 @@ int main(int argc, char *argv[])
             }
         }
 
-
+        (void)bluetooth_on; /* used only to drain rfkill events; state applied via g_idle_add */
         g_idle_add_full(PRIORITY_CHECK_BT_STATE, turn_on_bt_after_startup, &proxy, NULL);
         g_idle_add_full(PRIORITY_CHECK_BT_STATE, check_bt_state, &proxy, NULL);
 
@@ -961,6 +1078,14 @@ int main(int argc, char *argv[])
 
     if (proxy.bluetooth_hal_initialized) {
         fprintf(stderr, "Turning bluetooth off on stop.\n");
+
+        /* On shutdown, spoofing stops automatically since hardware was never modified */
+        if (bdaddr_spoofing && original_bdaddr_captured) {
+            char buf[18];
+            format_bdaddr(original_bdaddr, buf, sizeof(buf));
+            fprintf(stderr, "bluebinder: spoofing is off, original BD_ADDR restored: %s\n", buf);
+        }
+
         reply = gbinder_client_transact_sync_reply
             (proxy.binder_client, CLOSE, NULL, &status);
 
